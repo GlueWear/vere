@@ -3,6 +3,7 @@
 #include "vere.h"
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <arpa/inet.h>
 #include "noun.h"
 
 /* u3_chan: incoming ipc port connection.
@@ -30,7 +31,9 @@ typedef struct _u3_port {
   c3_c*              nam_c;           //  name of port
   c3_o               con_o;
   c3_o               liv_o;
-  struct _u3_shan*   san_u;           //  server reference
+  c3_o               udp_o;           //  UDP-backed transport port
+  uv_udp_t           wax_u;           //  UDP socket (when udp_o)
+  struct _u3_shan*   san_u;           //  server reference (pipe ports)
   struct _u3_lick*   lic_u;           //  device backpointer
   struct _u3_port*   nex_u;           //  next pointer
 } u3_port;
@@ -41,8 +44,16 @@ typedef struct _u3_lick {
   u3_auto            car_u;           //  driver
   c3_c*              fod_c;           //  IPC folder location
   u3_cue_xeno*       sil_u;           //  cue handle
+  c3_c*              uce_c;           //  UDP port map (LICK_UDP env), or NULL
   struct _u3_port*   gen_u;           //  port list
 } u3_lick;
+
+/* u3_lick_snd: outbound UDP send request + owned buffer.
+*/
+typedef struct _u3_lick_snd {
+  uv_udp_send_t      req_u;           //  libuv send request
+  c3_y*              buf_y;           //  packet bytes (freed in cb)
+} u3_lick_snd;
 
 static const c3_c URB_DEV_PATH[] = "/.urb/dev";
 
@@ -419,6 +430,208 @@ _lick_sock_err_chdir:
   u3_king_bail();
 }
 
+/* _lick_udp_port(): if `nam_c` is configured UDP-backed (LICK_UDP env,
+**                   "name=port,name=port"), return its bind port, else 0.
+**                   Keys match the port path without a leading '/'.
+*/
+static c3_s
+_lick_udp_port(u3_lick* lic_u, c3_c* nam_c)
+{
+  if ( !lic_u->uce_c ) {
+    return 0;
+  }
+  c3_c* key_c = ( '/' == nam_c[0] ) ? nam_c + 1 : nam_c;
+  c3_w  kln_w = strlen(key_c);
+  c3_c* cur_c = lic_u->uce_c;
+
+  while ( *cur_c ) {
+    c3_c* eq_c = strchr(cur_c, '=');
+    c3_c* cm_c = strchr(cur_c, ',');
+    if ( !eq_c ) {
+      break;
+    }
+    {
+      c3_w nln_w = (c3_w)(eq_c - cur_c);
+      if ( (nln_w == kln_w) && (0 == strncmp(cur_c, key_c, kln_w)) ) {
+        return (c3_s)atoi(eq_c + 1);
+      }
+    }
+    if ( !cm_c ) {
+      break;
+    }
+    cur_c = cm_c + 1;
+  }
+  return 0;
+}
+
+/* _lick_udp_alloc(): libuv recv buffer allocator (2K per datagram).
+*/
+static void
+_lick_udp_alloc(uv_handle_t* had_u, size_t len_i, uv_buf_t* buf)
+{
+  void* ptr_v = c3_malloc(2048);
+  *buf = uv_buf_init(ptr_v, 2048);
+}
+
+/* _lick_udp_send_cb(): free the send request + owned buffer.
+*/
+static void
+_lick_udp_send_cb(uv_udp_send_t* req_u, c3_i sas_i)
+{
+  u3_lick_snd* snd_u = (u3_lick_snd*)req_u;
+
+  if ( sas_i ) {
+    u3l_log("lick: udp send fail: %s", uv_strerror(sas_i));
+  }
+  c3_free(snd_u->buf_y);
+  c3_free(snd_u);
+}
+
+/* _lick_udp_send(): spit [lane blob] out a UDP-backed port.  V1 handles only
+**                   plain ip:port lanes ([%.n atom]); galaxy lanes ([%.y @p])
+**                   need DNS and are deferred to V2.  Consumes `dat`.
+*/
+static void
+_lick_udp_send(u3_port* gen_u, u3_noun dat)
+{
+  u3_noun lan, pac, tag, val;
+
+  if ( c3n == u3r_cell(dat, &lan, &pac) ) {
+    u3l_log("lick: udp spit: payload not [lane blob]");
+    u3z(dat);
+    return;
+  }
+  if ( c3n == u3r_cell(lan, &tag, &val) ) {
+    u3l_log("lick: udp spit: bad lane");
+    u3z(dat);
+    return;
+  }
+  //  c3y (%.y) == galaxy lane (V2/DNS); c3n (%.n) == ip:port (V1).
+  //
+  if ( c3y == tag ) {
+    u3l_log("lick: udp spit: galaxy lane unsupported in V1 (needs DNS)");
+    u3z(dat);
+    return;
+  }
+
+  {
+    u3_lane lan_u = u3_ames_decode_lane(u3k(val));
+    lan_u.pip_w = ( lan_u.pip_w ) ? lan_u.pip_w : 0x7f000001;
+
+    if ( !lan_u.por_s ) {
+      u3l_log("lick: udp spit: inscrutable lane");
+      u3z(dat);
+      return;
+    }
+
+    {
+      c3_w         len_w = u3r_met(3, pac);
+      u3_lick_snd* snd_u = c3_calloc(sizeof(*snd_u));
+      struct sockaddr_in add_u;
+      uv_buf_t     buf_u;
+      c3_i         sas_i;
+
+      snd_u->buf_y = c3_malloc((len_w ? len_w : 1));
+      u3r_bytes(0, len_w, snd_u->buf_y, pac);
+
+      memset(&add_u, 0, sizeof(add_u));
+      add_u.sin_family      = AF_INET;
+      add_u.sin_addr.s_addr = htonl(lan_u.pip_w);
+      add_u.sin_port        = htons(lan_u.por_s);
+
+      buf_u = uv_buf_init((c3_c*)snd_u->buf_y, len_w);
+      sas_i = uv_udp_send(&snd_u->req_u, &gen_u->wax_u, &buf_u, 1,
+                          (const struct sockaddr*)&add_u, _lick_udp_send_cb);
+      if ( sas_i ) {
+        u3l_log("lick: udp send: %s", uv_strerror(sas_i));
+        c3_free(snd_u->buf_y);
+        c3_free(snd_u);
+      }
+    }
+  }
+  u3z(dat);
+}
+
+/* _lick_udp_recv_cb(): inbound datagram on a UDP-backed port.  Encodes the
+**                      sender as a lane and soaks [%hear [lane blob]] to arvo.
+*/
+static void
+_lick_udp_recv_cb(uv_udp_t*              wax_u,
+                  ssize_t                nrd_i,
+                  const uv_buf_t*        buf_u,
+                  const struct sockaddr* adr_u,
+                  unsigned               flg_i)
+{
+  u3_port* gen_u = (u3_port*)wax_u->data;
+
+  if ( (0 >= nrd_i) || (flg_i & UV_UDP_PARTIAL) || (NULL == adr_u) ) {
+    c3_free(buf_u->base);
+    return;
+  }
+
+  {
+    struct sockaddr_in* add_u = (struct sockaddr_in*)adr_u;
+    u3_lane lan_u;
+    u3_noun lan, pac, wir, dev, cad;
+
+    lan_u.pip_w = ntohl(add_u->sin_addr.s_addr);
+    lan_u.por_s = ntohs(add_u->sin_port);
+
+    lan = u3nc(c3n, u3_ames_encode_lane(lan_u));
+    pac = u3i_bytes((c3_w)nrd_i, (c3_y*)buf_u->base);
+    c3_free(buf_u->base);
+
+    wir = u3nc(c3__lick, u3_nul);
+    dev = _lick_string_to_path(gen_u->nam_c + 1);
+    cad = u3nt(c3__soak, dev, u3nc(c3__hear, u3nc(lan, pac)));
+
+    u3_auto_peer(
+      u3_auto_plan(&gen_u->lic_u->car_u, u3_ovum_init(0, c3__l, wir, cad)),
+      0, 0, 0);
+  }
+}
+
+/* _lick_init_udp(): bind a UDP socket for a transport port and start reading.
+*/
+static void
+_lick_init_udp(u3_port* gen_u, c3_s por_s)
+{
+  c3_i err_i;
+  struct sockaddr_in add_u;
+
+  if ( 0 != (err_i = uv_udp_init(u3L, &gen_u->wax_u)) ) {
+    u3l_log("lick: udp init: %s", uv_strerror(err_i));
+    u3_king_bail();
+  }
+  gen_u->wax_u.data = gen_u;
+
+  uv_ip4_addr("0.0.0.0", por_s, &add_u);
+
+  if ( 0 != (err_i = uv_udp_bind(&gen_u->wax_u,
+                                 (const struct sockaddr*)&add_u, 0)) ) {
+    u3l_log("lick: udp bind :%u: %s", por_s, uv_strerror(err_i));
+    u3_king_bail();
+  }
+  if ( 0 != (err_i = uv_udp_recv_start(&gen_u->wax_u,
+                                       _lick_udp_alloc, _lick_udp_recv_cb)) ) {
+    u3l_log("lick: udp recv_start: %s", uv_strerror(err_i));
+    u3_king_bail();
+  }
+  u3l_log("lick: udp transport %s bound 0.0.0.0:%u", gen_u->nam_c, por_s);
+}
+
+/* _lick_udp_close_cb(): free the port after its UDP handle is closed.
+**                       (uv_close is async; the embedded handle can't be freed
+**                       until this fires, so we free the whole port here.)
+*/
+static void
+_lick_udp_close_cb(uv_handle_t* had_u)
+{
+  u3_port* gen_u = (u3_port*)had_u->data;
+  c3_free(gen_u->nam_c);
+  c3_free(gen_u);
+}
+
 /* u3_lick_ef_shut(): Close an IPC port
 */
 static void
@@ -432,14 +645,22 @@ _lick_ef_shut(u3_lick* lic_u, u3_noun nam)
   while ( NULL != cur_u ) {
     if ( 0 == strcmp(cur_u->nam_c, nam_c) ) {
       cur_u->liv_o = c3n;
-      _lick_close_sock(cur_u->san_u);
+      //  unlink from the port list first
+      //
       if( las_u == NULL ) {
         lic_u->gen_u = cur_u->nex_u;
       }
       else {
         las_u->nex_u = cur_u->nex_u;
       }
-      c3_free(cur_u);
+      if ( c3y == cur_u->udp_o ) {
+        //  close cb frees nam_c + the port
+        uv_close((uv_handle_t*)&cur_u->wax_u, _lick_udp_close_cb);
+      }
+      else {
+        _lick_close_sock(cur_u->san_u);
+        c3_free(cur_u);
+      }
       return;
     }
     las_u = cur_u;
@@ -464,17 +685,27 @@ _lick_ef_spin(u3_lick* lic_u, u3_noun nam)
     }
     las_u = las_u->nex_u;
   }
-  u3_port* gen_u      = c3_calloc(sizeof(*gen_u));
-  gen_u->san_u        = c3_calloc(sizeof(*gen_u->san_u));
+  u3_port* gen_u = c3_calloc(sizeof(*gen_u));
+  gen_u->lic_u   = lic_u;
+  gen_u->nam_c   = nam_c;
+  gen_u->con_o   = c3n;
+  gen_u->liv_o   = c3y;
 
-  gen_u->lic_u        = lic_u;
-  gen_u->san_u->gen_u = gen_u;
-  gen_u->nam_c        = nam_c;
-  gen_u->con_o        = c3n;
-  gen_u->liv_o        = c3y;
+  {
+    c3_s por_s = _lick_udp_port(lic_u, nam_c);
+    if ( por_s ) {
+      //  UDP-backed transport port: bind a socket instead of a pipe.
+      gen_u->udp_o = c3y;
+      _lick_init_udp(gen_u, por_s);
+    }
+    else {
+      gen_u->san_u        = c3_calloc(sizeof(*gen_u->san_u));
+      gen_u->san_u->gen_u = gen_u;
+      _lick_init_sock(gen_u->san_u);
+    }
+  }
 
-  _lick_init_sock(gen_u->san_u);
-  gen_u ->nex_u = lic_u->gen_u;
+  gen_u->nex_u = lic_u->gen_u;
   lic_u->gen_u = gen_u;
 }
 
@@ -499,7 +730,10 @@ _lick_ef_spit(u3_lick* lic_u, u3_noun nam, u3_noun dat)
     return;
   }
 
-  if( c3y == gen_u->con_o ) {
+  if ( c3y == gen_u->udp_o ) {
+    _lick_udp_send(gen_u, dat);
+  }
+  else if( c3y == gen_u->con_o ) {
     _lick_send_noun(gen_u->san_u->can_u, dat);
   }
   else {
@@ -609,14 +843,20 @@ _lick_io_exit(u3_auto* car_u)
   u3_port* cur_u = lic_u->gen_u;
   u3_port* nex_u;
   while ( NULL != cur_u ) {
-    _lick_close_sock(cur_u->san_u);
     nex_u = cur_u->nex_u;
-    c3_free(cur_u);
+    if ( c3y == cur_u->udp_o ) {
+      uv_close((uv_handle_t*)&cur_u->wax_u, _lick_udp_close_cb);
+    }
+    else {
+      _lick_close_sock(cur_u->san_u);
+      c3_free(cur_u);
+    }
     cur_u = nex_u;
   }
 
   u3s_cue_xeno_done(lic_u->sil_u);
   c3_free(lic_u->fod_c);
+  c3_free(lic_u->uce_c);
   c3_free(lic_u);
 }
 
@@ -643,6 +883,16 @@ u3_lick_io_init(u3_pier* pir_u)
 
   lic_u->sil_u = u3s_cue_xeno_init();
   lic_u->fod_c = strdup(pax_c);
+
+  {
+    //  UDP-backed transport ports: "name=port,name=port" (V1 config).
+    //
+    c3_c* env_c = getenv("LICK_UDP");
+    lic_u->uce_c = env_c ? strdup(env_c) : NULL;
+    if ( lic_u->uce_c ) {
+      u3l_log("lick: udp transport ports: %s", lic_u->uce_c);
+    }
+  }
 
   u3_auto* car_u = &lic_u->car_u;
   car_u->nam_m = c3__lick;
