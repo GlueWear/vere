@@ -487,66 +487,50 @@ _lick_udp_send_cb(uv_udp_send_t* req_u, c3_i sas_i)
   c3_free(snd_u);
 }
 
-/* _lick_udp_send(): spit [lane blob] out a UDP-backed port.  V1 handles only
-**                   plain ip:port lanes ([%.n atom]); galaxy lanes ([%.y @p])
-**                   need DNS and are deferred to V2.  Consumes `dat`.
+/* _lick_udp_send(): spit [lane blob] out a UDP-backed port.  Reuses Ames' lane
+**                   resolver (galaxy DNS / fakenet loopback / ip:port) and sends
+**                   on this port's own socket.  Consumes `dat`.
 */
 static void
 _lick_udp_send(u3_port* gen_u, u3_noun dat)
 {
-  u3_noun lan, pac, tag, val;
+  u3_noun lan, pac;
+  u3_lane lan_u;
 
   if ( c3n == u3r_cell(dat, &lan, &pac) ) {
     u3l_log("lick: udp spit: payload not [lane blob]");
     u3z(dat);
     return;
   }
-  if ( c3n == u3r_cell(lan, &tag, &val) ) {
-    u3l_log("lick: udp spit: bad lane");
-    u3z(dat);
-    return;
-  }
-  //  c3y (%.y) == galaxy lane (V2/DNS); c3n (%.n) == ip:port (V1).
+  //  resolve the lane -- galaxy (via DNS / fakenet loopback) or ip:port
   //
-  if ( c3y == tag ) {
-    u3l_log("lick: udp spit: galaxy lane unsupported in V1 (needs DNS)");
-    u3z(dat);
+  if ( c3n == u3_ames_lane_from_noun(lan, &lan_u) ) {
+    u3z(dat);   //  unresolved galaxy / bad lane: drop; the sender retries
     return;
   }
 
   {
-    u3_lane lan_u = u3_ames_decode_lane(u3k(val));
-    lan_u.pip_w = ( lan_u.pip_w ) ? lan_u.pip_w : 0x7f000001;
+    c3_w         len_w = u3r_met(3, pac);
+    u3_lick_snd* snd_u = c3_calloc(sizeof(*snd_u));
+    struct sockaddr_in add_u;
+    uv_buf_t     buf_u;
+    c3_i         sas_i;
 
-    if ( !lan_u.por_s ) {
-      u3l_log("lick: udp spit: inscrutable lane");
-      u3z(dat);
-      return;
-    }
+    snd_u->buf_y = c3_malloc((len_w ? len_w : 1));
+    u3r_bytes(0, len_w, snd_u->buf_y, pac);
 
-    {
-      c3_w         len_w = u3r_met(3, pac);
-      u3_lick_snd* snd_u = c3_calloc(sizeof(*snd_u));
-      struct sockaddr_in add_u;
-      uv_buf_t     buf_u;
-      c3_i         sas_i;
+    memset(&add_u, 0, sizeof(add_u));
+    add_u.sin_family      = AF_INET;
+    add_u.sin_addr.s_addr = htonl(lan_u.pip_w);
+    add_u.sin_port        = htons(lan_u.por_s);
 
-      snd_u->buf_y = c3_malloc((len_w ? len_w : 1));
-      u3r_bytes(0, len_w, snd_u->buf_y, pac);
-
-      memset(&add_u, 0, sizeof(add_u));
-      add_u.sin_family      = AF_INET;
-      add_u.sin_addr.s_addr = htonl(lan_u.pip_w);
-      add_u.sin_port        = htons(lan_u.por_s);
-
-      buf_u = uv_buf_init((c3_c*)snd_u->buf_y, len_w);
-      sas_i = uv_udp_send(&snd_u->req_u, &gen_u->wax_u, &buf_u, 1,
-                          (const struct sockaddr*)&add_u, _lick_udp_send_cb);
-      if ( sas_i ) {
-        u3l_log("lick: udp send: %s", uv_strerror(sas_i));
-        c3_free(snd_u->buf_y);
-        c3_free(snd_u);
-      }
+    buf_u = uv_buf_init((c3_c*)snd_u->buf_y, len_w);
+    sas_i = uv_udp_send(&snd_u->req_u, &gen_u->wax_u, &buf_u, 1,
+                        (const struct sockaddr*)&add_u, _lick_udp_send_cb);
+    if ( sas_i ) {
+      u3l_log("lick: udp send: %s", uv_strerror(sas_i));
+      c3_free(snd_u->buf_y);
+      c3_free(snd_u);
     }
   }
   u3z(dat);
