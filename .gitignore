@@ -293,3 +293,5 @@ GTAGS
 zig-out/
 .zig-cache/
 .build.log
+.build-fast.log
+zig-pkg/

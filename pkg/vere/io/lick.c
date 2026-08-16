@@ -360,9 +360,11 @@ _lick_mkdirp(c3_c* por_c)
   return c3y;
 }
 
-/* _lick_init_sock(): initialize socket device.
+/* _lick_init_sock(): initialize socket device.  Returns c3n (non-fatally) if the
+**                    socket path can't be created (e.g. a stale colliding path),
+**                    so one bad port degrades instead of bailing the whole ship.
 */
-static void
+static c3_o
 _lick_init_sock(u3_shan* san_u)
 {
   //  the full socket path is limited to about 108 characters,
@@ -415,10 +417,9 @@ _lick_init_sock(u3_shan* san_u)
     u3l_log("lick: chdir: %s", uv_strerror(errno));
     goto _lick_sock_err_close;
   }
-  return;
+  return c3y;
 
 _lick_sock_err_close:
-  uv_close((uv_handle_t*)&san_u->pyp_u, _lick_close_cb);
 _lick_sock_err_unlink:
   if ( 0 != unlink(gen_u->nam_c) ) {
     u3l_log("lick: unlink: %s", uv_strerror(errno));
@@ -427,7 +428,8 @@ _lick_sock_err_chdir:
   if ( 0 != chdir(pax_c) ) {
     u3l_log("lick: chdir: %s", uv_strerror(errno));
   }
-  u3_king_bail();
+  //  caller frees san_u/gen_u; don't bail the whole ship on a socket error
+  return c3n;
 }
 
 /* _lick_udp_port(): if `nam_c` is configured UDP-backed (LICK_UDP env,
@@ -743,7 +745,14 @@ _lick_ef_spin(u3_lick* lic_u, u3_noun nam)
     else {
       gen_u->san_u        = c3_calloc(sizeof(*gen_u->san_u));
       gen_u->san_u->gen_u = gen_u;
-      _lick_init_sock(gen_u->san_u);
+      if ( c3n == _lick_init_sock(gen_u->san_u) ) {
+        //  socket setup failed (e.g. stale path collision) -- skip this port
+        //  rather than bailing the ship.
+        c3_free(gen_u->san_u);
+        c3_free(gen_u->nam_c);
+        c3_free(gen_u);
+        return;
+      }
     }
   }
 
@@ -889,8 +898,12 @@ _lick_io_exit(u3_auto* car_u)
     if ( c3y == cur_u->udp_o ) {
       uv_close((uv_handle_t*)&cur_u->wax_u, _lick_udp_close_cb);
     }
-    else {
+    else if ( NULL != cur_u->san_u ) {
       _lick_close_sock(cur_u->san_u);
+      c3_free(cur_u);
+    }
+    else {
+      c3_free(cur_u->nam_c);
       c3_free(cur_u);
     }
     cur_u = nex_u;
