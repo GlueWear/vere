@@ -610,7 +610,16 @@ _lick_udp_recv_cb(uv_udp_t*              wax_u,
     lan_u.pip_w = ntohl(add_u->sin_addr.s_addr);
     lan_u.por_s = ntohs(add_u->sin_port);
 
-    lan = u3nc(c3n, u3_ames_encode_lane(lan_u));
+    //  encode the sender lane in the form the target expects: mesa wants a
+    //  mesa-lane [%if ip por]; legacy ames wants a bare address atom (pyre wraps
+    //  it as [%| addr] = [%.n addr] before injecting).
+    //
+    if ( c3__heer == mar ) {
+      lan = u3nt(c3__if, u3i_word(lan_u.pip_w), u3i_word((c3_w)lan_u.por_s));
+    }
+    else {
+      lan = u3_ames_encode_lane(lan_u);
+    }
     pac = u3i_bytes((c3_w)nrd_i, byt_y);
     c3_free(buf_u->base);
 
