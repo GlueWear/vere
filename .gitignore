@@ -288,3 +288,10 @@ GTAGS
 /nel
 /nev
 /fes
+
+# local build artifacts
+zig-out/
+.zig-cache/
+.build.log
+.build-fast.log
+zig-pkg/

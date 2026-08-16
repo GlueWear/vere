@@ -1140,10 +1140,24 @@
         u3_noun
         u3_ames_encode_lane(u3_lane);
 
+      /* u3_ames_lane_from_noun(): resolve an ames lane noun ([galaxy]/[ip:port])
+      **   to a u3_lane via Ames' resolver (galaxy DNS + ip:port).  RETAINs the
+      **   noun; c3n if unresolved/bad.  For reuse by other io drivers.
+      */
+        c3_o
+        u3_ames_lane_from_noun(u3_noun, u3_lane*);
+
     /**  mesa
     **/
         u3_auto*
         u3_mesa_io_init(u3_pier* pir_u);
+
+      /* u3_mesa_realise_lane(): resolve a Mesa lane noun (galaxy / [%if ip por])
+      **   to a sockaddr.  CONSUMES the noun; port 0 means unresolved/bad.  For
+      **   reuse by other io drivers.
+      */
+        struct sockaddr_in
+        u3_mesa_realise_lane(u3_noun);
 
 
     /**  Storage.

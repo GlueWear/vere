@@ -1328,6 +1328,17 @@ _ames_send_lane(u3_ames* sam_u, u3_noun lan, u3_lane* lan_u)
   }
 }
 
+/* u3_ames_lane_from_noun(): public wrapper on _ames_send_lane, so other io
+**   drivers (e.g. lick UDP transport ports) can reuse Ames' full lane
+**   resolution -- galaxy DNS (fakenet loopback / live cache) and ip:port --
+**   without duplicating it.  RETAIN `lan`; returns c3n if unresolved/bad.
+*/
+c3_o
+u3_ames_lane_from_noun(u3_noun lan, u3_lane* lan_u)
+{
+  return _ames_send_lane(u3_Host.sam_u, lan, lan_u);
+}
+
 /* _ames_ef_send(): send packet to network (v4).
 */
 static void

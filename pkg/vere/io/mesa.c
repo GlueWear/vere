@@ -1236,6 +1236,16 @@ _realise_lane(u3_noun lan) {
   return lan_u;
 }
 
+/* u3_mesa_realise_lane(): public wrapper on _realise_lane, so other io drivers
+**   (e.g. lick UDP transport ports) can resolve a single Mesa lane noun
+**   (galaxy / [%if ip por]) to a sockaddr.  CONSUMES `lan`.  port 0 == bad.
+*/
+struct sockaddr_in
+u3_mesa_realise_lane(u3_noun lan)
+{
+  return _realise_lane(lan);
+}
+
 static void
 _mesa_send_bufs(u3_mesa* sam_u,
                 u3_peer* per_u, // null for response packets
