@@ -1152,6 +1152,13 @@
         u3_auto*
         u3_mesa_io_init(u3_pier* pir_u);
 
+      /* u3_mesa_realise_lane(): resolve a Mesa lane noun (galaxy / [%if ip por])
+      **   to a sockaddr.  CONSUMES the noun; port 0 means unresolved/bad.  For
+      **   reuse by other io drivers.
+      */
+        struct sockaddr_in
+        u3_mesa_realise_lane(u3_noun);
+
 
     /**  Storage.
     **/

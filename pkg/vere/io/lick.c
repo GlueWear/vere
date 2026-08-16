@@ -487,51 +487,87 @@ _lick_udp_send_cb(uv_udp_send_t* req_u, c3_i sas_i)
   c3_free(snd_u);
 }
 
-/* _lick_udp_send(): spit [lane blob] out a UDP-backed port.  Reuses Ames' lane
-**                   resolver (galaxy DNS / fakenet loopback / ip:port) and sends
-**                   on this port's own socket.  Consumes `dat`.
+/* _lick_udp_send_to(): send `pac` (an atom, RETAINED) to a resolved sockaddr on
+**                      this port's own socket.  Copies the bytes into an owned
+**                      buffer freed in the send callback.
+*/
+static void
+_lick_udp_send_to(u3_port* gen_u, struct sockaddr_in add_u, u3_noun pac)
+{
+  c3_w         len_w = u3r_met(3, pac);
+  u3_lick_snd* snd_u = c3_calloc(sizeof(*snd_u));
+  uv_buf_t     buf_u;
+  c3_i         sas_i;
+
+  add_u.sin_family = AF_INET;
+  snd_u->buf_y = c3_malloc((len_w ? len_w : 1));
+  u3r_bytes(0, len_w, snd_u->buf_y, pac);
+
+  buf_u = uv_buf_init((c3_c*)snd_u->buf_y, len_w);
+  sas_i = uv_udp_send(&snd_u->req_u, &gen_u->wax_u, &buf_u, 1,
+                      (const struct sockaddr*)&add_u, _lick_udp_send_cb);
+  if ( sas_i ) {
+    u3l_log("lick: udp send: %s", uv_strerror(sas_i));
+    c3_free(snd_u->buf_y);
+    c3_free(snd_u);
+  }
+}
+
+/* _lick_udp_send(): spit [kind lane(s) blob] out a UDP-backed port.  Dispatches
+**                   on kind: %send = one Ames lane (galaxy DNS / ip:port);
+**                   %push = a list of Mesa lanes (send to each usable one).
+**                   Consumes `dat`.
 */
 static void
 _lick_udp_send(u3_port* gen_u, u3_noun dat)
 {
-  u3_noun lan, pac;
-  u3_lane lan_u;
+  u3_noun kind, rest, lan, pac;
 
-  if ( c3n == u3r_cell(dat, &lan, &pac) ) {
-    u3l_log("lick: udp spit: payload not [lane blob]");
+  if (  (c3n == u3r_cell(dat, &kind, &rest))
+     || (c3n == u3r_cell(rest, &lan, &pac)) )
+  {
+    u3l_log("lick: udp spit: payload not [kind lane(s) blob]");
     u3z(dat);
     return;
   }
-  //  resolve the lane -- galaxy (via DNS / fakenet loopback) or ip:port
-  //
-  if ( c3n == u3_ames_lane_from_noun(lan, &lan_u) ) {
-    u3z(dat);   //  unresolved galaxy / bad lane: drop; the sender retries
-    return;
-  }
 
-  {
-    c3_w         len_w = u3r_met(3, pac);
-    u3_lick_snd* snd_u = c3_calloc(sizeof(*snd_u));
-    struct sockaddr_in add_u;
-    uv_buf_t     buf_u;
-    c3_i         sas_i;
+  switch ( kind ) {
+    default: {
+      u3l_log("lick: udp spit: unknown kind");
+    } break;
 
-    snd_u->buf_y = c3_malloc((len_w ? len_w : 1));
-    u3r_bytes(0, len_w, snd_u->buf_y, pac);
+    //  %send: a single Ames lane ([galaxy] / [ip:port])
+    //
+    case c3__send: {
+      u3_lane lan_u;
+      if ( c3y == u3_ames_lane_from_noun(lan, &lan_u) ) {
+        struct sockaddr_in add_u;
+        memset(&add_u, 0, sizeof(add_u));
+        add_u.sin_family      = AF_INET;
+        add_u.sin_addr.s_addr = htonl(lan_u.pip_w);
+        add_u.sin_port        = htons(lan_u.por_s);
+        _lick_udp_send_to(gen_u, add_u, pac);
+      }
+    } break;
 
-    memset(&add_u, 0, sizeof(add_u));
-    add_u.sin_family      = AF_INET;
-    add_u.sin_addr.s_addr = htonl(lan_u.pip_w);
-    add_u.sin_port        = htons(lan_u.por_s);
-
-    buf_u = uv_buf_init((c3_c*)snd_u->buf_y, len_w);
-    sas_i = uv_udp_send(&snd_u->req_u, &gen_u->wax_u, &buf_u, 1,
-                        (const struct sockaddr*)&add_u, _lick_udp_send_cb);
-    if ( sas_i ) {
-      u3l_log("lick: udp send: %s", uv_strerror(sas_i));
-      c3_free(snd_u->buf_y);
-      c3_free(snd_u);
-    }
+    //  %push: a list of Mesa lanes -- send to each resolvable one
+    //
+    case c3__push: {
+      u3_noun las = lan;
+      while ( u3_nul != las ) {
+        u3_noun i_las, t_las;
+        if ( c3n == u3r_cell(las, &i_las, &t_las) ) {
+          break;
+        }
+        {
+          struct sockaddr_in add_u = u3_mesa_realise_lane(u3k(i_las));
+          if ( (0 != add_u.sin_port) && (0 != add_u.sin_addr.s_addr) ) {
+            _lick_udp_send_to(gen_u, add_u, pac);
+          }
+        }
+        las = t_las;
+      }
+    } break;
   }
   u3z(dat);
 }
@@ -555,19 +591,32 @@ _lick_udp_recv_cb(uv_udp_t*              wax_u,
 
   {
     struct sockaddr_in* add_u = (struct sockaddr_in*)adr_u;
+    c3_y*   byt_y = (c3_y*)buf_u->base;
     u3_lane lan_u;
     u3_noun lan, pac, wir, dev, cad;
+    u3_noun mar   = c3__hear;   //  legacy Ames inbound -> %hear
+
+    //  Mesa (408) pacts carry 0x67e00200 (LE) at offset 4; route those to %heer
+    //  (mesa inbound).  Anything else is a legacy Ames shot -> %hear.
+    //
+    if ( nrd_i >= 8 ) {
+      c3_w tag_w = byt_y[4] | (byt_y[5] << 8)
+                 | (byt_y[6] << 16) | ((c3_w)byt_y[7] << 24);
+      if ( 0x67e00200 == tag_w ) {
+        mar = c3__heer;
+      }
+    }
 
     lan_u.pip_w = ntohl(add_u->sin_addr.s_addr);
     lan_u.por_s = ntohs(add_u->sin_port);
 
     lan = u3nc(c3n, u3_ames_encode_lane(lan_u));
-    pac = u3i_bytes((c3_w)nrd_i, (c3_y*)buf_u->base);
+    pac = u3i_bytes((c3_w)nrd_i, byt_y);
     c3_free(buf_u->base);
 
     wir = u3nc(c3__lick, u3_nul);
     dev = _lick_string_to_path(gen_u->nam_c + 1);
-    cad = u3nt(c3__soak, dev, u3nc(c3__hear, u3nc(lan, pac)));
+    cad = u3nt(c3__soak, dev, u3nc(mar, u3nc(lan, pac)));
 
     u3_auto_peer(
       u3_auto_plan(&gen_u->lic_u->car_u, u3_ovum_init(0, c3__l, wir, cad)),
