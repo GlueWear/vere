@@ -688,6 +688,7 @@ _lick_ef_shut(u3_lick* lic_u, u3_noun nam)
 
   while ( NULL != cur_u ) {
     if ( 0 == strcmp(cur_u->nam_c, nam_c) ) {
+      c3_free(nam_c);
       cur_u->liv_o = c3n;
       //  unlink from the port list first
       //
@@ -710,6 +711,7 @@ _lick_ef_shut(u3_lick* lic_u, u3_noun nam)
     las_u = cur_u;
     cur_u = cur_u->nex_u;
   }
+  c3_free(nam_c);
   // XX We should delete empty folders in the pier/.urb/dev path
 }
 
@@ -777,9 +779,11 @@ _lick_ef_spit(u3_lick* lic_u, u3_noun nam, u3_noun dat)
   }
   if ( NULL == gen_u ) {
     u3l_log("lick: spit: gen %s not found", nam_c);
+    c3_free(nam_c);
     u3z(dat);
     return;
   }
+  c3_free(nam_c);
 
   if ( c3y == gen_u->udp_o ) {
     _lick_udp_send(gen_u, dat);
