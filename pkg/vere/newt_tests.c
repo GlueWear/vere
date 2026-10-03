@@ -3,6 +3,10 @@
 #include "noun.h"
 #include "vere.h"
 
+#include <signal.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 /* _setup(): prepare for tests.
 */
 static void
@@ -335,6 +339,77 @@ _test_newt_vast(void)
   u3z(a);
 }
 
+/* _test_newt_hangup(): a reply written after the peer hung up.
+**
+**   A conn.sock client that sends a command and closes its socket before
+**   the response arrives makes the response write fail with EPIPE. The
+**   owner's bail function then does what conn.c does: queues one more
+**   write (its bail message) and stops the stream, replacing bal_f with a
+**   destructor. That queued write fails too; if newt reports it through
+**   bal_f, the destructor runs while libuv still owns the handle and again
+**   from the close callback, and the runtime later faults inside libuv.
+**   The destructor must run exactly once, from the close callback.
+*/
+static u3_mojo _hup_moj_u;
+static c3_w    _hup_fal_w;
+static c3_w    _hup_fre_w;
+
+static void
+_hup_free(void* ptr_v, ssize_t err_i, const c3_c* err_c)
+{
+  _hup_fre_w++;
+}
+
+static void
+_hup_bail(void* ptr_v, ssize_t err_i, const c3_c* err_c)
+{
+  _hup_fal_w++;
+
+  c3_y* buf_y = c3_malloc(1);
+  buf_y[0] = 0;
+  u3_newt_send(&_hup_moj_u, 1, buf_y);
+  u3_newt_mojo_stop(&_hup_moj_u, _hup_free);
+}
+
+static void
+_test_newt_hangup(void)
+{
+  uv_loop_t lup_u;
+  c3_i      fds_i[2];
+
+  signal(SIGPIPE, SIG_IGN);   //  as the runtime does
+
+  if ( uv_loop_init(&lup_u)
+       || socketpair(AF_UNIX, SOCK_STREAM, 0, fds_i)
+       || uv_pipe_init(&lup_u, &_hup_moj_u.pyp_u, 0)
+       || uv_pipe_open(&_hup_moj_u.pyp_u, fds_i[0]) )
+  {
+    fprintf(stderr, "newt: hangup: setup failed\r\n");
+    exit(1);
+  }
+  _hup_moj_u.bal_f = _hup_bail;
+  _hup_moj_u.ptr_v = 0;
+
+  close(fds_i[1]);            //  the client hangs up
+
+  c3_y* buf_y = c3_malloc(4);
+  memcpy(buf_y, "pong", 4);
+  u3_newt_send(&_hup_moj_u, 4, buf_y);
+
+  uv_run(&lup_u, UV_RUN_DEFAULT);
+
+  if ( (1 != _hup_fal_w) || (1 != _hup_fre_w) ) {
+    fprintf(stderr, "newt: hangup: %u failure call(s), %u destructor call(s); want 1 and 1\r\n",
+            _hup_fal_w, _hup_fre_w);
+    exit(1);
+  }
+
+  if ( uv_loop_close(&lup_u) ) {
+    fprintf(stderr, "newt: hangup: loop still has handles\r\n");
+    exit(1);
+  }
+}
+
 /* main(): run all test cases.
 */
 int
@@ -344,6 +419,7 @@ main(int argc, char* argv[])
 
   _test_newt_smol();
   _test_newt_vast();
+  _test_newt_hangup();
 
   //  GC
   //
