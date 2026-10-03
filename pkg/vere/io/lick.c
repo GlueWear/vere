@@ -5,6 +5,13 @@
 #include <sys/types.h>
 #include <arpa/inet.h>
 #include "noun.h"
+#include "io/ames/stun.h"
+
+typedef enum u3_lick_stun_state {
+  LICK_STUN_OFF = 0,
+  LICK_STUN_TRYING = 1,
+  LICK_STUN_KEEPALIVE = 2,
+} u3_lick_stun_state;
 
 /* u3_chan: incoming ipc port connection.
 */
@@ -33,6 +40,18 @@ typedef struct _u3_port {
   c3_o               liv_o;
   c3_o               udp_o;           //  UDP-backed transport port
   uv_udp_t           wax_u;           //  UDP socket (when udp_o)
+  c3_y               clo_y;           //  UDP handles awaiting close callbacks
+  struct {                            //  per-guest STUN client state
+    u3_lick_stun_state sat_y;          //    current STUN state
+    c3_y               tid_y[12];      //    current transaction id
+    c3_y               dad_y;          //    terminal sponsoring galaxy
+    u3_lane            lan_u;          //    sponsoring galaxy lane
+    uv_timer_t         tim_u;          //    keepalive/retry timer
+    struct timeval     sar_u;          //    start of current attempt
+    u3_lane            sef_u;          //    observed public lane
+    c3_o               wok_o;          //    at least one successful cycle
+    c3_o               ini_o;          //    timer handle initialized
+  } sun_u;
   struct _u3_shan*   san_u;           //  server reference (pipe ports)
   struct _u3_lick*   lic_u;           //  device backpointer
   struct _u3_port*   nex_u;           //  next pointer
@@ -466,6 +485,18 @@ _lick_udp_port(u3_lick* lic_u, c3_c* nam_c)
   return 0;
 }
 
+/* Theseus guest transports use an OS-allocated port unless explicitly mapped.
+** Keep ordinary Lick IPC paths on Unix sockets.
+*/
+static c3_o
+_lick_udp_guest(const c3_c* nam_c)
+{
+  const c3_c* pre_c = "/theseus-pyre/utp/~";
+  size_t len_i = strlen(pre_c);
+  return ( 0 == strncmp(nam_c, pre_c, len_i) && nam_c[len_i]
+        && !strchr(nam_c + len_i, '/') ) ? c3y : c3n;
+}
+
 /* _lick_udp_alloc(): libuv recv buffer allocator (2K per datagram).
 */
 static void
@@ -515,6 +546,277 @@ _lick_udp_send_to(u3_port* gen_u, struct sockaddr_in add_u, u3_noun pac)
   }
 }
 
+static void _lick_stun_timer_cb(uv_timer_t* tim_u);
+
+/* _lick_stun_schedule(): arm this guest's STUN timer.
+*/
+static c3_o
+_lick_stun_schedule(u3_port* gen_u, uv_timer_cb cb_f, c3_d mil_d)
+{
+  c3_i err_i;
+
+  if ( (c3n == gen_u->liv_o) || (c3n == gen_u->sun_u.ini_o) ) {
+    return c3n;
+  }
+  if ( 0 != (err_i = uv_timer_start(&gen_u->sun_u.tim_u, cb_f, mil_d, 0)) ) {
+    u3l_log("lick: stun timer %s: %s", gen_u->nam_c, uv_strerror(err_i));
+    gen_u->sun_u.sat_y = LICK_STUN_OFF;
+    return c3n;
+  }
+  return c3y;
+}
+
+/* _lick_stun_card(): build a stock-shaped %stun soak for this guest.
+*/
+static u3_noun
+_lick_stun_card(u3_port* gen_u, u3_noun mod, u3_lane lan_u)
+{
+  u3_noun dev, dat, lan;
+
+  lan = u3nc(c3n, u3_ames_encode_lane(lan_u));
+  dat = u3nt(mod, u3i_word(gen_u->sun_u.dad_y), lan);
+  dev = _lick_string_to_path(gen_u->nam_c + 1);
+  return u3nt(c3__soak, dev, u3nc(c3__stun, dat));
+}
+
+/* _lick_stun_emit(): soak a stock-shaped %stun result back to this guest.
+*/
+static void
+_lick_stun_emit(u3_port* gen_u, u3_noun mod, u3_lane lan_u)
+{
+  u3_noun wir, cad;
+
+  if ( c3n == gen_u->liv_o ) {
+    return;
+  }
+
+  wir = u3nc(c3__lick, u3_nul);
+  cad = _lick_stun_card(gen_u, mod, lan_u);
+
+  u3_auto_peer(
+    u3_auto_plan(&gen_u->lic_u->car_u, u3_ovum_init(0, c3__l, wir, cad)),
+    0, 0, 0);
+}
+
+/* _lick_stun_resolve(): resolve the sponsoring galaxy through host Ames.
+*/
+static c3_o
+_lick_stun_resolve(u3_port* gen_u)
+{
+  u3_noun lan = u3nc(c3y, u3i_word(gen_u->sun_u.dad_y));
+  c3_o ret_o = u3_ames_lane_from_noun(lan, &gen_u->sun_u.lan_u);
+  u3z(lan);
+  return ret_o;
+}
+
+/* _lick_stun_send_request(): send a binding request from the guest socket.
+*/
+static void
+_lick_stun_send_request(u3_port* gen_u)
+{
+  c3_y req_y[28];
+  struct sockaddr_in add_u;
+  u3_noun pac;
+
+  if ( LICK_STUN_OFF == gen_u->sun_u.sat_y ) {
+    return;
+  }
+
+  u3_stun_make_request(req_y, gen_u->sun_u.tid_y);
+  memset(&add_u, 0, sizeof(add_u));
+  add_u.sin_family = AF_INET;
+  add_u.sin_addr.s_addr = htonl(gen_u->sun_u.lan_u.pip_w);
+  add_u.sin_port = htons(gen_u->sun_u.lan_u.por_s);
+
+  pac = u3i_bytes(sizeof(req_y), req_y);
+  _lick_udp_send_to(gen_u, add_u, pac);
+  u3z(pac);
+}
+
+/* _lick_stun_start(): begin or restart this guest's STUN cycle.
+*/
+static void
+_lick_stun_start(u3_port* gen_u, c3_w tim_w)
+{
+  c3_w eny_w[16];
+
+  if ( (c3n == gen_u->liv_o) || (c3n == gen_u->sun_u.ini_o) ) {
+    return;
+  }
+  c3_rand(eny_w);
+  memcpy(gen_u->sun_u.tid_y, eny_w, sizeof(gen_u->sun_u.tid_y));
+
+  gen_u->sun_u.sat_y = LICK_STUN_KEEPALIVE;
+  _lick_stun_schedule(gen_u, _lick_stun_timer_cb, tim_w);
+}
+
+/* _lick_stun_reset_cb(): restart after a failed STUN cycle.
+*/
+static void
+_lick_stun_reset_cb(uv_timer_t* tim_u)
+{
+  _lick_stun_start((u3_port*)tim_u->data, 39000);
+}
+
+/* _lick_stun_on_lost(): report the first loss after success, then retry.
+*/
+static void
+_lick_stun_on_lost(u3_port* gen_u)
+{
+  gen_u->sun_u.sat_y = LICK_STUN_OFF;
+
+  if ( c3y == gen_u->sun_u.wok_o ) {
+    _lick_stun_emit(gen_u, c3__fail, gen_u->sun_u.sef_u);
+    gen_u->sun_u.wok_o = c3n;
+  }
+  _lick_stun_schedule(gen_u, _lick_stun_reset_cb, 5 * 1000);
+}
+
+/* _lick_stun_time_gap(): elapsed milliseconds in the current attempt.
+*/
+static c3_d
+_lick_stun_time_gap(struct timeval sar_u)
+{
+  struct timeval now_u;
+  gettimeofday(&now_u, 0);
+  u3_noun now = u3m_time_in_tv(&now_u);
+  u3_noun sar = u3m_time_in_tv(&sar_u);
+  return u3m_time_gap_ms(sar, now);
+}
+
+/* _lick_stun_timer_cb(): advance one guest's STUN state machine.
+*/
+static void
+_lick_stun_timer_cb(uv_timer_t* tim_u)
+{
+  u3_port* gen_u = (u3_port*)tim_u->data;
+  c3_w rto_w = 500;
+
+  switch ( gen_u->sun_u.sat_y ) {
+    case LICK_STUN_OFF: break;
+
+    case LICK_STUN_KEEPALIVE: {
+      if ( c3n == _lick_stun_resolve(gen_u) ) {
+        _lick_stun_schedule(gen_u, _lick_stun_timer_cb, 25 * 1000);
+      }
+      else {
+        gen_u->sun_u.sat_y = LICK_STUN_TRYING;
+        gettimeofday(&gen_u->sun_u.sar_u, 0);
+        _lick_stun_schedule(gen_u, _lick_stun_timer_cb, rto_w);
+        _lick_stun_send_request(gen_u);
+      }
+    } break;
+
+    case LICK_STUN_TRYING: {
+      c3_d gap_d = _lick_stun_time_gap(gen_u->sun_u.sar_u);
+
+      if ( gap_d >= 39500 ) {
+        _lick_stun_on_lost(gen_u);
+      }
+      else {
+        c3_d nex_d = gap_d + rto_w;
+        c3_w tim_w = (gap_d >= 31500) ? 8000 : c3_max(nex_d, 31500);
+        _lick_stun_schedule(gen_u, _lick_stun_timer_cb, tim_w);
+        _lick_stun_send_request(gen_u);
+      }
+    } break;
+
+    default: u3_assert(!"invalid lick STUN state");
+  }
+}
+
+/* _lick_stun_on_request(): answer a binding request on the guest socket.
+*/
+static void
+_lick_stun_on_request(u3_port* gen_u,
+                      const c3_y* req_y,
+                      struct sockaddr_in add_u)
+{
+  c3_y res_y[40];
+  u3_lane lan_u = {
+    .por_s = ntohs(add_u.sin_port),
+    .pip_w = ntohl(add_u.sin_addr.s_addr)
+  };
+  u3_noun pac;
+
+  u3_stun_make_response(req_y, &lan_u, res_y);
+  pac = u3i_bytes(sizeof(res_y), res_y);
+  _lick_udp_send_to(gen_u, add_u, pac);
+  u3z(pac);
+}
+
+/* _lick_stun_on_response(): update the guest lane and notify virtual Ames.
+*/
+static void
+_lick_stun_on_response(u3_port* gen_u, c3_y* buf_y, c3_w len_w)
+{
+  u3_lane lan_u;
+
+  if ( c3n == u3_stun_find_xor_mapped_address(buf_y, len_w, &lan_u) ) {
+    return;
+  }
+
+  if (  (gen_u->sun_u.sef_u.por_s != lan_u.por_s)
+     || (gen_u->sun_u.sef_u.pip_w != lan_u.pip_w) )
+  {
+    _lick_stun_emit(gen_u, c3__once, lan_u);
+  }
+  else if ( c3n == gen_u->sun_u.wok_o ) {
+    _lick_stun_emit(gen_u, c3__stop, lan_u);
+    gen_u->sun_u.wok_o = c3y;
+  }
+
+  gen_u->sun_u.sef_u = lan_u;
+  if ( LICK_STUN_TRYING == gen_u->sun_u.sat_y ) {
+    _lick_stun_start(gen_u, 25 * 1000);
+  }
+}
+
+/* _lick_stun_saxo(): select the terminal galaxy from a sponsorship chain.
+*/
+static void
+_lick_stun_saxo(u3_port* gen_u, u3_noun zad)
+{
+  u3_noun cur = zad;
+  u3_noun our = u3_none;
+  u3_noun dad = u3_none;
+  u3_noun hed, tal;
+  c3_y our_y, dad_y;
+
+  while ( u3_nul != cur ) {
+    if ( c3n == u3r_cell(cur, &hed, &tal) ) {
+      u3l_log("lick: stun %s: malformed sponsorship chain", gen_u->nam_c);
+      return;
+    }
+    if ( u3_none == our ) {
+      our = hed;
+    }
+    dad = hed;
+    cur = tal;
+  }
+
+  if ( u3_none == dad ) {
+    u3l_log("lick: stun %s: empty sponsorship chain", gen_u->nam_c);
+    return;
+  }
+  if ( c3y == u3r_safe_byte(our, &our_y) ) {
+    uv_timer_stop(&gen_u->sun_u.tim_u);
+    gen_u->sun_u.sat_y = LICK_STUN_OFF;
+    return;
+  }
+  if ( c3n == u3r_safe_byte(dad, &dad_y) ) {
+    u3l_log("lick: stun %s: terminal sponsor is not a galaxy", gen_u->nam_c);
+    return;
+  }
+
+  if ( gen_u->sun_u.dad_y != dad_y ) {
+    gen_u->sun_u.sef_u = (u3_lane){0};
+    gen_u->sun_u.wok_o = c3n;
+  }
+  gen_u->sun_u.dad_y = dad_y;
+  _lick_stun_start(gen_u, 0);
+}
+
 /* _lick_udp_send(): spit [kind lane(s) blob] out a UDP-backed port.  Dispatches
 **                   on kind: %send = one Ames lane (galaxy DNS / ip:port);
 **                   %push = a list of Mesa lanes (send to each usable one).
@@ -525,9 +827,17 @@ _lick_udp_send(u3_port* gen_u, u3_noun dat)
 {
   u3_noun kind, rest, lan, pac;
 
-  if (  (c3n == u3r_cell(dat, &kind, &rest))
-     || (c3n == u3r_cell(rest, &lan, &pac)) )
-  {
+  if ( c3n == u3r_cell(dat, &kind, &rest) ) {
+    u3l_log("lick: udp spit: payload not a cell");
+    u3z(dat);
+    return;
+  }
+  if ( c3__saxo == kind ) {
+    _lick_stun_saxo(gen_u, rest);
+    u3z(dat);
+    return;
+  }
+  if ( c3n == u3r_cell(rest, &lan, &pac) ) {
     u3l_log("lick: udp spit: payload not [kind lane(s) blob]");
     u3z(dat);
     return;
@@ -598,6 +908,22 @@ _lick_udp_recv_cb(uv_udp_t*              wax_u,
     u3_noun lan, pac, wir, dev, cad;
     u3_noun mar   = c3__hear;   //  legacy Ames inbound -> %hear
 
+    //  STUN belongs to the guest socket, not the host Ames socket.  Answer
+    //  requests here and consume responses for this port's own transaction.
+    //
+    if ( c3y == u3_stun_is_request(byt_y, (c3_w)nrd_i) ) {
+      _lick_stun_on_request(gen_u, byt_y, *add_u);
+      c3_free(buf_u->base);
+      return;
+    }
+    if ( c3y == u3_stun_is_our_response(byt_y, gen_u->sun_u.tid_y,
+                                        (c3_w)nrd_i) )
+    {
+      _lick_stun_on_response(gen_u, byt_y, (c3_w)nrd_i);
+      c3_free(buf_u->base);
+      return;
+    }
+
     //  Mesa (408) pacts carry 0x67e00200 (LE) at offset 4; route those to %heer
     //  (mesa inbound).  Anything else is a legacy Ames shot -> %hear.
     //
@@ -637,7 +963,27 @@ _lick_udp_recv_cb(uv_udp_t*              wax_u,
 
 /* _lick_init_udp(): bind a UDP socket for a transport port and start reading.
 */
+static void _lick_udp_close_cb(uv_handle_t* had_u);
+
+/* _lick_udp_close(): stop and close both handles owned by a UDP port.
+*/
 static void
+_lick_udp_close(u3_port* gen_u)
+{
+  if ( !uv_is_closing((uv_handle_t*)&gen_u->wax_u) ) {
+    gen_u->clo_y++;
+    uv_close((uv_handle_t*)&gen_u->wax_u, _lick_udp_close_cb);
+  }
+  if (  (c3y == gen_u->sun_u.ini_o)
+     && !uv_is_closing((uv_handle_t*)&gen_u->sun_u.tim_u) )
+  {
+    uv_timer_stop(&gen_u->sun_u.tim_u);
+    gen_u->clo_y++;
+    uv_close((uv_handle_t*)&gen_u->sun_u.tim_u, _lick_udp_close_cb);
+  }
+}
+
+static c3_o
 _lick_init_udp(u3_port* gen_u, c3_s por_s)
 {
   c3_i err_i;
@@ -645,7 +991,9 @@ _lick_init_udp(u3_port* gen_u, c3_s por_s)
 
   if ( 0 != (err_i = uv_udp_init(u3L, &gen_u->wax_u)) ) {
     u3l_log("lick: udp init: %s", uv_strerror(err_i));
-    u3_king_bail();
+    c3_free(gen_u->nam_c);
+    c3_free(gen_u);
+    return c3n;
   }
   gen_u->wax_u.data = gen_u;
 
@@ -654,14 +1002,32 @@ _lick_init_udp(u3_port* gen_u, c3_s por_s)
   if ( 0 != (err_i = uv_udp_bind(&gen_u->wax_u,
                                  (const struct sockaddr*)&add_u, 0)) ) {
     u3l_log("lick: udp bind :%u: %s", por_s, uv_strerror(err_i));
-    u3_king_bail();
+    _lick_udp_close(gen_u);
+    return c3n;
   }
   if ( 0 != (err_i = uv_udp_recv_start(&gen_u->wax_u,
                                        _lick_udp_alloc, _lick_udp_recv_cb)) ) {
     u3l_log("lick: udp recv_start: %s", uv_strerror(err_i));
-    u3_king_bail();
+    _lick_udp_close(gen_u);
+    return c3n;
   }
-  u3l_log("lick: udp transport %s bound 0.0.0.0:%u", gen_u->nam_c, por_s);
+  c3_i len_i = sizeof(add_u);
+  if ( 0 != (err_i = uv_udp_getsockname(&gen_u->wax_u,
+                                        (struct sockaddr*)&add_u, &len_i)) ) {
+    u3l_log("lick: udp getsockname: %s", uv_strerror(err_i));
+    _lick_udp_close(gen_u);
+    return c3n;
+  }
+  if ( 0 != (err_i = uv_timer_init(u3L, &gen_u->sun_u.tim_u)) ) {
+    u3l_log("lick: stun timer init: %s", uv_strerror(err_i));
+    _lick_udp_close(gen_u);
+    return c3n;
+  }
+  gen_u->sun_u.ini_o = c3y;
+  gen_u->sun_u.tim_u.data = gen_u;
+  u3l_log("lick: udp transport %s bound 0.0.0.0:%u",
+          gen_u->nam_c, ntohs(add_u.sin_port));
+  return c3y;
 }
 
 /* _lick_udp_close_cb(): free the port after its UDP handle is closed.
@@ -672,8 +1038,11 @@ static void
 _lick_udp_close_cb(uv_handle_t* had_u)
 {
   u3_port* gen_u = (u3_port*)had_u->data;
-  c3_free(gen_u->nam_c);
-  c3_free(gen_u);
+  u3_assert(gen_u->clo_y);
+  if ( 0 == --gen_u->clo_y ) {
+    c3_free(gen_u->nam_c);
+    c3_free(gen_u);
+  }
 }
 
 /* u3_lick_ef_shut(): Close an IPC port
@@ -699,8 +1068,8 @@ _lick_ef_shut(u3_lick* lic_u, u3_noun nam)
         las_u->nex_u = cur_u->nex_u;
       }
       if ( c3y == cur_u->udp_o ) {
-        //  close cb frees nam_c + the port
-        uv_close((uv_handle_t*)&cur_u->wax_u, _lick_udp_close_cb);
+        //  final close callback frees nam_c + the port
+        _lick_udp_close(cur_u);
       }
       else {
         _lick_close_sock(cur_u->san_u);
@@ -736,13 +1105,17 @@ _lick_ef_spin(u3_lick* lic_u, u3_noun nam)
   gen_u->nam_c   = nam_c;
   gen_u->con_o   = c3n;
   gen_u->liv_o   = c3y;
+  gen_u->sun_u.ini_o = c3n;
+  gen_u->sun_u.wok_o = c3n;
 
   {
     c3_s por_s = _lick_udp_port(lic_u, nam_c);
-    if ( por_s ) {
+    if ( por_s || c3y == _lick_udp_guest(nam_c) ) {
       //  UDP-backed transport port: bind a socket instead of a pipe.
       gen_u->udp_o = c3y;
-      _lick_init_udp(gen_u, por_s);
+      if ( c3n == _lick_init_udp(gen_u, por_s) ) {
+        return;
+      }
     }
     else {
       gen_u->san_u        = c3_calloc(sizeof(*gen_u->san_u));
@@ -900,7 +1273,8 @@ _lick_io_exit(u3_auto* car_u)
   while ( NULL != cur_u ) {
     nex_u = cur_u->nex_u;
     if ( c3y == cur_u->udp_o ) {
-      uv_close((uv_handle_t*)&cur_u->wax_u, _lick_udp_close_cb);
+      cur_u->liv_o = c3n;
+      _lick_udp_close(cur_u);
     }
     else if ( NULL != cur_u->san_u ) {
       _lick_close_sock(cur_u->san_u);
